@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MIDI Piano</title>
+<style>
+  :root {
+    --white-w: 52px;
+    --white-h: 200px;
+    --black-w: 32px;
+    --black-h: 120px;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #2b2b33;
+    color: #e8e8ee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin: 0;
+    padding: 32px 16px;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 16px; }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 24px;
+  }
+  .controls label { font-size: 14px; color: #b8b8c4; }
+  select {
+    font-size: 14px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid #55555f;
+    background: #3a3a44;
+    color: #e8e8ee;
+  }
+  #status { font-size: 13px; color: #8a8a96; min-height: 1.2em; margin-bottom: 16px; }
+  #error {
+    max-width: 480px;
+    background: #4a2f33;
+    border: 1px solid #7a4a50;
+    border-radius: 8px;
+    padding: 16px 20px;
+    font-size: 15px;
+    line-height: 1.5;
+    margin-bottom: 24px;
+    display: none;
+  }
+  #piano {
+    position: relative;
+    height: var(--white-h);
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .key {
+    position: absolute;
+    top: 0;
+    box-sizing: border-box;
+    border-radius: 0 0 6px 6px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    padding-bottom: 8px;
+    touch-action: none;
+  }
+  .key.white {
+    width: var(--white-w);
+    height: var(--white-h);
+    background: linear-gradient(#fdfdfd, #eaeaea);
+    border: 1px solid #999;
+    z-index: 1;
+  }
+  .key.black {
+    width: var(--black-w);
+    height: var(--black-h);
+    background: linear-gradient(#3a3a3a, #111);
+    border: 1px solid #000;
+    z-index: 2;
+  }
+  .key.white.down { background: linear-gradient(#bcd8f5, #9cc4ec); }
+  .key.black.down { background: linear-gradient(#4a6f96, #2d4a6b); }
+  .key .hint {
+    font-size: 12px;
+    font-weight: 600;
+    color: #777;
+    pointer-events: none;
+  }
+  .key.black .hint { color: #aaa; }
+  .key .note-name {
+    font-size: 10px;
+    color: #a55;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <h1>MIDI Piano</h1>
+  <div class="controls">
+    <label for="device">Output:</label>
+    <select id="device"></select>
+  </div>
+  <div id="status"></div>
+  <div id="error"></div>
+  <div id="piano"></div>
+
+<script>
+"use strict";
+
+const LOW_NOTE = 60;   // C4
+const HIGH_NOTE = 84;  // C6
+const VELOCITY = 100;
+const CHANNEL = 0;     // MIDI channel 1
+
+// Computer-keyboard mapping: lower octave on the Z row, upper on the Q row.
+const KEYMAP = {
+  z: 60, s: 61, x: 62, d: 63, c: 64, v: 65, g: 66, b: 67, h: 68, n: 69, j: 70, m: 71,
+  q: 72, "2": 73, w: 74, "3": 75, e: 76, r: 77, "5": 78, t: 79, "6": 80, y: 81, "7": 82, u: 83,
+  i: 84,
+};
+
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const isBlack = (note) => [1, 3, 6, 8, 10].includes(note % 12);
+const noteName = (note) => NOTE_NAMES[note % 12] + (Math.floor(note / 12) - 1);
+
+const piano = document.getElementById("piano");
+const deviceSelect = document.getElementById("device");
+const statusEl = document.getElementById("status");
+const errorEl = document.getElementById("error");
+
+let midi = null;
+let output = null;
+const heldNotes = new Set();
+const keyEls = {};
+
+// --- Build the keyboard ---------------------------------------------------
+
+const hintFor = {};
+for (const [k, note] of Object.entries(KEYMAP)) hintFor[note] = k.toUpperCase();
+
+(function buildKeys() {
+  const whiteW = 52, blackW = 32;
+  let whiteIndex = 0;
+  for (let note = LOW_NOTE; note <= HIGH_NOTE; note++) {
+    const el = document.createElement("div");
+    el.dataset.note = note;
+    if (isBlack(note)) {
+      el.className = "key black";
+      el.style.left = whiteIndex * whiteW - blackW / 2 + "px";
+    } else {
+      el.className = "key white";
+      el.style.left = whiteIndex * whiteW + "px";
+      whiteIndex++;
+    }
+    if (note % 12 === 0) {
+      const name = document.createElement("span");
+      name.className = "note-name";
+      name.textContent = noteName(note);
+      el.appendChild(name);
+    }
+    if (hintFor[note]) {
+      const hint = document.createElement("span");
+      hint.className = "hint";
+      hint.textContent = hintFor[note];
+      el.appendChild(hint);
+    }
+    piano.appendChild(el);
+    keyEls[note] = el;
+  }
+  piano.style.width = whiteIndex * whiteW + "px";
+})();
+
+// --- MIDI -------------------------------------------------------------------
+
+function noteOn(note) {
+  if (heldNotes.has(note)) return;
+  heldNotes.add(note);
+  keyEls[note].classList.add("down");
+  if (output) output.send([0x90 | CHANNEL, note, VELOCITY]);
+}
+
+function noteOff(note) {
+  if (!heldNotes.has(note)) return;
+  heldNotes.delete(note);
+  keyEls[note].classList.remove("down");
+  if (output) output.send([0x80 | CHANNEL, note, 0]);
+}
+
+function releaseAll() {
+  for (const note of [...heldNotes]) noteOff(note);
+}
+
+function refreshDevices() {
+  const previous = deviceSelect.value;
+  deviceSelect.innerHTML = "";
+  const outputs = [...midi.outputs.values()];
+  if (outputs.length === 0) {
+    deviceSelect.appendChild(new Option("(no MIDI outputs found)", ""));
+    output = null;
+    statusEl.textContent = "No MIDI output devices available.";
+    return;
+  }
+  for (const out of outputs) {
+    deviceSelect.appendChild(new Option(out.name, out.id));
+  }
+  const ids = outputs.map((o) => o.id);
+  if (ids.includes(previous)) {
+    deviceSelect.value = previous;
+  } else {
+    const iac = outputs.find((o) => /iac/i.test(o.name));
+    deviceSelect.value = (iac || outputs[0]).id;
+  }
+  selectOutput();
+}
+
+function selectOutput() {
+  releaseAll();
+  output = midi.outputs.get(deviceSelect.value) || null;
+  statusEl.textContent = output ? "Sending to: " + output.name : "";
+}
+
+function showError(html) {
+  errorEl.innerHTML = html;
+  errorEl.style.display = "block";
+  deviceSelect.disabled = true;
+}
+
+if (!navigator.requestMIDIAccess) {
+  showError("This browser doesn't support the Web MIDI API.<br>" +
+            "Please open this file in <b>Chrome</b> or <b>Edge</b>.");
+} else {
+  navigator.requestMIDIAccess().then((access) => {
+    midi = access;
+    midi.onstatechange = refreshDevices;
+    refreshDevices();
+  }, () => {
+    showError("MIDI access was denied. Reload the page and click <b>Allow</b> " +
+              "when the browser asks for MIDI permission.");
+  });
+}
+
+deviceSelect.addEventListener("change", selectOutput);
+
+// --- Mouse / touch input ----------------------------------------------------
+
+piano.addEventListener("pointerdown", (e) => {
+  const note = e.target.dataset && e.target.dataset.note;
+  if (!note) return;
+  e.preventDefault();
+  noteOn(+note);
+});
+
+function pointerRelease(e) {
+  const note = e.target.dataset && e.target.dataset.note;
+  if (note) noteOff(+note);
+}
+piano.addEventListener("pointerup", pointerRelease);
+piano.addEventListener("pointerout", pointerRelease);
+
+// --- Computer keyboard input -------------------------------------------------
+
+window.addEventListener("keydown", (e) => {
+  if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+  const note = KEYMAP[e.key.toLowerCase()];
+  if (note !== undefined) {
+    e.preventDefault();
+    noteOn(note);
+  }
+});
+
+window.addEventListener("keyup", (e) => {
+  const note = KEYMAP[e.key.toLowerCase()];
+  if (note !== undefined) noteOff(note);
+});
+
+// --- Stuck-note safety --------------------------------------------------------
+
+window.addEventListener("blur", releaseAll);
+window.addEventListener("pagehide", releaseAll);
+</script>
+</body>
+</html>
